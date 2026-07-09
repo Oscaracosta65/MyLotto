@@ -25097,17 +25097,28 @@ function mleAdvisoryBuildVisualRunRows(array $activeRows, array $perfRows) {
         if ($drawDate !== '') {
             $drawTs = strtotime($drawDate);
             if ($drawTs !== false && $drawTs < time()) {
-                try {
-                    $__actualParts = mleAdvisoryResolveActualDrawPartsForVisual(
-                        array('draw_date' => $drawDate),
-                        $s, $pred, $predExtra
-                    );
-                    $actual = array_values(array_map('intval', (array)$__actualParts['main']));
-                    $actualExtra = array_values(array_map('intval', (array)$__actualParts['extra']));
-                    if (!empty($__actualParts['found']) && (!empty($actual) || !empty($actualExtra))) {
-                        $completed = true;
-                    }
-                } catch (\Throwable $e) { }
+                // For daily predictions with a date-only target (midnight timestamp),
+                // the draw time within that day is unknown. Do not attempt a result
+                // lookup unless the date is strictly before today; otherwise a same-day
+                // result for a different session would incorrectly mark this pending
+                // prediction as completed.
+                $__drawSafeToLookup = true;
+                if ($__isDailyForVisual && date('H:i:s', $drawTs) === '00:00:00') {
+                    $__drawSafeToLookup = (date('Y-m-d', $drawTs) < date('Y-m-d'));
+                }
+                if ($__drawSafeToLookup) {
+                    try {
+                        $__actualParts = mleAdvisoryResolveActualDrawPartsForVisual(
+                            array('draw_date' => $drawDate),
+                            $s, $pred, $predExtra
+                        );
+                        $actual = array_values(array_map('intval', (array)$__actualParts['main']));
+                        $actualExtra = array_values(array_map('intval', (array)$__actualParts['extra']));
+                        if (!empty($__actualParts['found']) && (!empty($actual) || !empty($actualExtra))) {
+                            $completed = true;
+                        }
+                    } catch (\Throwable $e) { }
+                }
             }
         }
         $matches = $completed ? array_values(array_intersect($pred, $actual)) : array();
@@ -38313,6 +38324,11 @@ if (!function_exists('mleV102DirectLatestOfficialDraw')) {
         if ($tbl === '') { return array('has_result' => false, 'source' => 'no_db_table_for_game_id'); }
         $realTable = $db->replacePrefix($tbl);
 
+        // Extract lottery config for the eligibility check below.
+        $__directCfg = (isset($spec['lotteryConfig']) && is_array($spec['lotteryConfig']))
+            ? $spec['lotteryConfig']
+            : array();
+
         try {
             $colsMeta = $db->getTableColumns($realTable, false);
             $cols = array();
@@ -38340,6 +38356,12 @@ if (!function_exists('mleV102DirectLatestOfficialDraw')) {
                 $dateRaw = trim((string)($row['draw_date'] ?? $row['req_date'] ?? ''));
                 $ts = $dateRaw !== '' ? strtotime($dateRaw) : false;
                 if ($ts === false || $ts <= 0) { continue; }
+                // Apply the same eligibility guard used by getLatestDrawing so that
+                // daily lottery rows for today are not returned before the draw occurs.
+                if (function_exists('mylottoexpertIsDrawRowEligibleForTarget') &&
+                    !mylottoexpertIsDrawRowEligibleForTarget($gameId, $row, $__directCfg, $dateRaw, null, null)) {
+                    continue;
+                }
                 $parts = mleV102ExtractOfficialParts($gameId, $row);
                 if (!empty($parts['main'])) {
                     return array(
