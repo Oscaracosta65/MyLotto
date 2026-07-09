@@ -2047,7 +2047,7 @@ function mylottoexpertBuildPredictionTarget(array $args)
     );
 }
 
-function mylottoexpertResolveOfficialDrawTarget($lotteryId, $gameId, $inputDateOrDrawAt = null)
+function mylottoexpertResolveOfficialDrawTarget($lotteryId, $gameId, $inputDateOrDrawAt = null, $allowNowFallback = true)
 {
     $lotteryId = (int)$lotteryId;
     $gameId    = trim((string)$gameId);
@@ -2161,32 +2161,60 @@ function mylottoexpertResolveOfficialDrawTarget($lotteryId, $gameId, $inputDateO
             }
         }
     } else {
-
-        try {
-            $nowLocal       = new \Joomla\CMS\Date\Date('now', $resolvedTz);
-            $targetDrawDate = $nowLocal->format('Y-m-d', true);
-        } catch (\Throwable $__) {
-            $targetDrawDate = date('Y-m-d');
+        $nextScheduledRow = null;
+        if ($gameId !== '' && function_exists('getNextScheduledDrawing')) {
+            try {
+                $__resolverDb = \Joomla\CMS\Factory::getDbo();
+                $nextScheduledRow = getNextScheduledDrawing($gameId, $__resolverDb);
+            } catch (\Throwable $__) {
+                $nextScheduledRow = null;
+            }
+        }
+        if (is_array($nextScheduledRow) && !empty($nextScheduledRow)) {
+            $__nextDrawRaw = trim((string)($nextScheduledRow['draw_date'] ?? ''));
+            $__nextDrawTs = $__nextDrawRaw !== '' ? strtotime($__nextDrawRaw) : false;
+            if ($__nextDrawTs !== false) {
+                $targetDrawDate = date('Y-m-d', $__nextDrawTs);
+                $__nextDrawAt = date('Y-m-d H:i:s', $__nextDrawTs);
+                $targetDrawAt = (date('H:i:s', $__nextDrawTs) === '00:00:00') ? null : $__nextDrawAt;
+                $sourceReason = 'official_schedule_next_draw';
+                $resolutionNote = 'Resolved from next scheduled official draw row for game_id=' . $gameId . ', lottery_id=' . $lotteryId;
+            }
+            unset($__nextDrawRaw, $__nextDrawTs, $__nextDrawAt);
+        }
+        if ($targetDrawDate === '' && $allowNowFallback) {
+            try {
+                $nowLocal       = new \Joomla\CMS\Date\Date('now', $resolvedTz);
+                $targetDrawDate = $nowLocal->format('Y-m-d', true);
+            } catch (\Throwable $__) {
+                $targetDrawDate = date('Y-m-d');
+            }
+            $sourceReason = ($sourceReason !== '') ? $sourceReason : 'now_fallback';
+            $resolutionNote = ($resolutionNote !== '') ? $resolutionNote : 'No posted draw target and no upcoming schedule row; fell back to current local date.';
         }
     }
 
-    try {
-        $dtLabelObj  = new \Joomla\CMS\Date\Date(($targetDrawAt !== null ? $targetDrawAt : $targetDrawDate), $resolvedTz);
-        $tzAbbr      = (new \DateTimeZone($resolvedTz))->getName();
+    if ($targetDrawDate !== '' || $targetDrawAt !== null) {
+        try {
+            $dtLabelObj  = new \Joomla\CMS\Date\Date(($targetDrawAt !== null ? $targetDrawAt : $targetDrawDate), $resolvedTz);
+            $tzAbbr      = (new \DateTimeZone($resolvedTz))->getName();
 
-        $tzAbbrMap   = array(
-            'America/New_York'    => 'ET',
-            'America/Chicago'     => 'CT',
-            'America/Denver'      => 'MT',
-            'America/Phoenix'     => 'MT',
-            'America/Los_Angeles' => 'PT',
-            'America/Anchorage'   => 'AKT',
-            'Pacific/Honolulu'    => 'HT',
-        );
-        $tzDisplay   = isset($tzAbbrMap[$resolvedTz]) ? $tzAbbrMap[$resolvedTz] : $tzAbbr;
-        $targetDrawLabel = 'Draw: ' . $dtLabelObj->format('M j, Y', true) . ' ' . $tzDisplay;
-    } catch (\Throwable $__) {
-        $targetDrawLabel = 'Draw: ' . $targetDrawDate;
+            $tzAbbrMap   = array(
+                'America/New_York'    => 'ET',
+                'America/Chicago'     => 'CT',
+                'America/Denver'      => 'MT',
+                'America/Phoenix'     => 'MT',
+                'America/Los_Angeles' => 'PT',
+                'America/Anchorage'   => 'AKT',
+                'Pacific/Honolulu'    => 'HT',
+            );
+            $tzDisplay   = isset($tzAbbrMap[$resolvedTz]) ? $tzAbbrMap[$resolvedTz] : $tzAbbr;
+            $targetDrawLabel = 'Draw: ' . $dtLabelObj->format('M j, Y', true) . ' ' . $tzDisplay;
+        } catch (\Throwable $__) {
+            $targetDrawLabel = 'Draw: ' . $targetDrawDate;
+        }
+    } else {
+        $targetDrawLabel = 'Draw: TBD';
     }
 
     return array(
@@ -24873,6 +24901,50 @@ function mleAdvisoryNumbersFromJson($raw) {
     return $out;
 }
 
+if (!function_exists('mleAdvisoryIsPendingRowEligibleForOfficialCheck')) {
+    function mleAdvisoryIsPendingRowEligibleForOfficialCheck(array $row, $drawDate, $isDaily = false)
+    {
+        $drawDate = trim((string)$drawDate);
+        if ($drawDate === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', substr($drawDate, 0, 10))) {
+            return false;
+        }
+        $drawDate = substr($drawDate, 0, 10);
+        $timezoneId = trim((string)($row['target_timezone_id'] ?? $row['target_draw_timezone'] ?? $row['timezone_id'] ?? 'America/New_York'));
+        try {
+            $timezone = new \DateTimeZone($timezoneId !== '' ? $timezoneId : 'America/New_York');
+        } catch (\Throwable $e) {
+            $timezone = new \DateTimeZone('America/New_York');
+        }
+        $drawAtRaw = trim((string)($row['target_draw_at'] ?? $row['next_draw_at'] ?? ''));
+        $drawAtTzId = trim((string)($row['target_draw_at_tz'] ?? ''));
+        if ($drawAtTzId === '') { $drawAtTzId = $timezone->getName(); }
+        if ($drawAtRaw !== '' && strncmp($drawAtRaw, '0000-00-00', 10) !== 0) {
+            try {
+                $drawAtTz = new \DateTimeZone($drawAtTzId);
+            } catch (\Throwable $e) {
+                $drawAtTz = $timezone;
+            }
+            $drawAtObj = null;
+            try {
+                $drawAtObj = new \DateTime($drawAtRaw, $drawAtTz);
+            } catch (\Throwable $e) {
+                $drawAtObj = null;
+            }
+            if ($drawAtObj instanceof \DateTimeInterface) {
+                if ($drawAtObj->format('H:i:s') !== '00:00:00') {
+                    $nowObj = new \DateTime('now', $drawAtTz);
+                    return ($drawAtObj->getTimestamp() <= $nowObj->getTimestamp());
+                }
+            }
+        }
+        $todayLocal = (new \DateTime('now', $timezone))->format('Y-m-d');
+        if ($isDaily) {
+            return ($drawDate < $todayLocal);
+        }
+        return false;
+    }
+}
+
 function mleAdvisoryBuildVisualRunRows(array $activeRows, array $perfRows) {
     $savedById = array();
     foreach ($activeRows as $r) { $savedById[(int)($r['id'] ?? 0)] = $r; }
@@ -25094,32 +25166,28 @@ function mleAdvisoryBuildVisualRunRows(array $activeRows, array $perfRows) {
             'message' => 'Official draw result not loaded yet',
             'cached_mismatch' => false,
         );
-        if ($drawDate !== '') {
-            $drawTs = strtotime($drawDate);
-            if ($drawTs !== false && $drawTs < time()) {
-                // For daily predictions with a date-only target (midnight timestamp),
-                // the draw time within that day is unknown. Do not attempt a result
-                // lookup unless the date is strictly before today; otherwise a same-day
-                // result for a different session would incorrectly mark this pending
-                // prediction as completed.
-                $__drawSafeToLookup = true;
-                if ($__isDailyForVisual && date('H:i:s', $drawTs) === '00:00:00') {
-                    $__drawSafeToLookup = (date('Y-m-d', $drawTs) < date('Y-m-d'));
+        if ($drawDate !== '' && function_exists('mleAdvisoryIsPendingRowEligibleForOfficialCheck')
+            && mleAdvisoryIsPendingRowEligibleForOfficialCheck($s, $drawDate, $__isDailyForVisual)
+        ) {
+            try {
+                $__actualParts = mleAdvisoryResolveActualDrawPartsForVisual(
+                    array(
+                        'draw_date' => $drawDate,
+                        'target_draw_date' => (string)($s['target_draw_date'] ?? $drawDate),
+                        'target_draw_at' => (string)($s['target_draw_at'] ?? $s['next_draw_at'] ?? ''),
+                        'target_draw_session' => (string)($s['target_draw_session'] ?? $s['draw_session'] ?? ''),
+                        'target_timezone_id' => (string)($s['target_timezone_id'] ?? $s['target_draw_timezone'] ?? ''),
+                    ),
+                    $s,
+                    $pred,
+                    $predExtra
+                );
+                $actual = array_values(array_map('intval', (array)$__actualParts['main']));
+                $actualExtra = array_values(array_map('intval', (array)$__actualParts['extra']));
+                if (!empty($__actualParts['found']) && (!empty($actual) || !empty($actualExtra))) {
+                    $completed = true;
                 }
-                if ($__drawSafeToLookup) {
-                    try {
-                        $__actualParts = mleAdvisoryResolveActualDrawPartsForVisual(
-                            array('draw_date' => $drawDate),
-                            $s, $pred, $predExtra
-                        );
-                        $actual = array_values(array_map('intval', (array)$__actualParts['main']));
-                        $actualExtra = array_values(array_map('intval', (array)$__actualParts['extra']));
-                        if (!empty($__actualParts['found']) && (!empty($actual) || !empty($actualExtra))) {
-                            $completed = true;
-                        }
-                    } catch (\Throwable $e) { }
-                }
-            }
+            } catch (\Throwable $e) { }
         }
         $matches = $completed ? array_values(array_intersect($pred, $actual)) : array();
         $extraMatches = $completed ? array_values(array_intersect($predExtra, $actualExtra)) : array();
@@ -29253,9 +29321,7 @@ function mleAdvisoryBuildLotteryCard($db, $userId, $lotteryId, $lotteryName = ''
     else { $decision='Keep building prediction history before making a firm call.'; }
     $visual=mleAdvisoryBuildVisualRunRows($activeRows,$perf);
 
-    $__mleAutoScoreResult = function_exists('mleAdvisoryPersistCompletedVisualRuns')
-        ? mleAdvisoryPersistCompletedVisualRuns($db, $userId, $lotteryId, $resolvedLotteryName, $visual, $savedById)
-        : array('attempted'=>0,'saved'=>0,'skipped'=>0,'errors'=>array());
+    $__mleAutoScoreResult = array('attempted'=>0,'saved'=>0,'skipped'=>0,'errors'=>array());
     if (!empty($__mleAutoScoreResult['saved'])) {
         $perf=mleAdvisoryLoadMatchedPerformance($db,$userId,$lotteryId,$activeRows);
         if (function_exists('mylottoexpertV98AppendSavedScoredRowsAsPerformance')) { $perf = mylottoexpertV98AppendSavedScoredRowsAsPerformance((array)$perf, (array)$activeRows); }
@@ -31551,6 +31617,8 @@ if (!function_exists('mylottoexpertBuildEvidenceReadinessStatus')) {
             'cap_line'=>$capLine,
             'primary_pick_confidence'=>$primaryPickConfidence,
             'backup_pick_confidence'=>$backupPickConfidence,
+            'top_settings_confidence'=>$primaryPickConfidence,
+            'second_best_settings_confidence'=>$backupPickConfidence,
             'batch_scientific_confidence'=>$batchScientificConfidence,
             'one_plus_coverage_rate'=>$onePlusRate,
             'component_scores'=>array(
@@ -33808,16 +33876,6 @@ if ($__mleAction === 'create_skai_batch') {
     if ($__batchTargetDrawDate !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $__batchTargetDrawDate)) {
         $__batchTargetDrawDate = '';
     }
-    if ($__batchTargetDrawDate === '') {
-        foreach ($__batchRows as $__batchDateRow) {
-            $__batchDateCandidate = trim((string)($__batchDateRow['target_draw_date'] ?? $__batchDateRow['next_draw_date'] ?? ''));
-            if ($__batchDateCandidate !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $__batchDateCandidate)) {
-                $__batchTargetDrawDate = $__batchDateCandidate;
-                break;
-            }
-        }
-        unset($__batchDateRow, $__batchDateCandidate);
-    }
 
     $__batchSharedProfile = function_exists('mylottoexpertBuildAndSaveSharedSkaiHistoryWindowProfile') ? mylottoexpertBuildAndSaveSharedSkaiHistoryWindowProfile($db, $__batchLotteryId, $__batchRows) : array();
     $__batchGlobalIntel = is_array($__batchSharedProfile['global_settings_intelligence'] ?? null) ? $__batchSharedProfile['global_settings_intelligence'] : array();
@@ -34510,6 +34568,19 @@ if ($__mleAction === 'create_skai_batch') {
     $__batchRecommendedForSave = (string)($__batchPlan['recommended_value'] ?? ($__batchSettingsAdv['suggested_value'] ?? ''));
     $__batchNow = date('Y-m-d H:i:s');
     $__batchGameIdForResearch = (string)($__batchSkaiMeta['gameId'] ?? '');
+    $__batchDrawTarget = function_exists('mylottoexpertResolveOfficialDrawTarget')
+        ? mylottoexpertResolveOfficialDrawTarget($__batchLotteryId, $__batchGameIdForResearch, $__batchTargetDrawDate !== '' ? $__batchTargetDrawDate : null, false)
+        : array('target_draw_date' => $__batchTargetDrawDate, 'target_draw_timezone' => 'America/New_York', 'target_draw_source' => 'fallback', 'target_draw_resolution_note' => '', 'target_draw_label' => $__batchTargetDrawDate);
+    if ($__batchTargetDrawDate !== '') {
+        $__batchDrawTarget['target_draw_date'] = $__batchTargetDrawDate;
+    } else {
+        $__batchTargetDrawDate = (string)($__batchDrawTarget['target_draw_date'] ?? '');
+    }
+    if ($__batchTargetDrawDate === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $__batchTargetDrawDate)) {
+        $app->enqueueMessage('Batch test was not created because an upcoming official draw target could not be resolved. Please refresh draw data and try again.', 'error');
+        $app->redirect(\Joomla\CMS\Uri\Uri::getInstance()->toString());
+        return;
+    }
     $__batchResearchFingerprint = mylottoexpertV97BuildSettingsFingerprint($__batchBaseSettings, $__batchLotteryId, $__batchGameIdForResearch, '', array('setting_key'=>$__batchSettingKey,'batch_type'=>$__batchTypeLabel,'run_values'=>implode('|', (array)$__batchRunValues),'research_mode'=>$__batchV97ResearchMode));
     $__batchResearchType = !empty($__batchUseV97GlobalResearchDirect) ? (string)$__batchV97ResearchMode : 'personal_plus_global';
     $__batchResearchQueueId = mylottoexpertV97CreateResearchQueueItem($db, $__batchLotteryId, $__batchGameIdForResearch, $__batchPlan, $__batchResearchFingerprint, $__batchResearchType, $__batchNow);
@@ -34563,16 +34634,6 @@ if ($__mleAction === 'create_skai_batch') {
         $__batchResearchAssignmentId = mylottoexpertV97CreateResearchAssignment($db, $__batchResearchQueueId, $workspaceUserId, $__batchLotteryId, $__batchGameIdForResearch, $__batchHeaderId, $__batchNow);
         $__batchSource = (string)($__batchTopMethod['method'] ?? 'skai');
         $__batchRunPhase = ($__batchRequestedPlan === 'horizon') ? 'horizon' : (($__batchRequestedPlan === 'regular_9_batch') ? 'regular' : 'settings');
-
-        $__batchDrawTarget = function_exists('mylottoexpertResolveOfficialDrawTarget')
-            ? mylottoexpertResolveOfficialDrawTarget($__batchLotteryId, $__batchGameIdForResearch, $__batchTargetDrawDate !== '' ? $__batchTargetDrawDate : null)
-            : array('target_draw_date' => $__batchTargetDrawDate, 'target_draw_timezone' => 'America/New_York', 'target_draw_source' => 'fallback', 'target_draw_resolution_note' => '', 'target_draw_label' => $__batchTargetDrawDate);
-
-        if ($__batchTargetDrawDate !== '') {
-            $__batchDrawTarget['target_draw_date'] = $__batchTargetDrawDate;
-        } else {
-            $__batchTargetDrawDate = (string)($__batchDrawTarget['target_draw_date'] ?? '');
-        }
 
         $__batchInsertedRunCount = 0;
         foreach ($__batchRunLabels as $__batchRunIdx => $__batchRunLabel) {
@@ -35089,26 +35150,44 @@ if ($__mleAction === 'run_skai_precision_lock_batch') {
         $settings['skai_top_n_combos'] = max(5, (int)($settings['skai_top_n_combos'] ?? 5));
         $settings['top_n_combos'] = max(5, (int)($settings['top_n_combos'] ?? 5));
 
-        $drawDateRaw = trim((string)($predictionPayload['target_draw_date'] ?? $predictionPayload['next_draw_date'] ?? ''));
+        $drawDateRaw = trim((string)($predictionPayload['target_draw_date'] ?? $predictionPayload['next_draw_date'] ?? $run['target_draw_date'] ?? $header['target_draw_date'] ?? ''));
+        $__drawFallback = array();
         if ($drawDateRaw !== '' && preg_match('/^(\d{4}-\d{2}-\d{2})/', $drawDateRaw, $__ddm)) {
             $drawDate = $__ddm[1];
         } else {
-
             $__drawFallback = function_exists('mylottoexpertResolveOfficialDrawTarget')
-                ? mylottoexpertResolveOfficialDrawTarget((int)$lotteryId, (string)($lotteryRow['game_id'] ?? ''))
-                : array('target_draw_date' => date('Y-m-d'));
-            $drawDate = (string)($__drawFallback['target_draw_date'] ?? date('Y-m-d'));
-            unset($__drawFallback);
+                ? mylottoexpertResolveOfficialDrawTarget((int)$lotteryId, (string)($lotteryRow['game_id'] ?? ''), null, false)
+                : array('target_draw_date' => '');
+            $drawDate = (string)($__drawFallback['target_draw_date'] ?? '');
         }
         unset($__ddm);
-        $drawAt = trim((string)($predictionPayload['target_draw_at'] ?? ''));
+        $drawAt = trim((string)($predictionPayload['target_draw_at'] ?? $run['target_draw_at'] ?? $__drawFallback['target_draw_at'] ?? ''));
+        if ($drawDate === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $drawDate)) {
+            $failedCount++;
+            if (in_array('status', $runCols, true)) {
+                try {
+                    $rq = $db->getQuery(true)
+                        ->update($db->quoteName('#__mle_skai_batch_run'))
+                        ->set($db->quoteName('status') . " = 'failed'")
+                        ->where($db->quoteName('id') . ' = ' . (int)$runId)
+                        ->where($db->quoteName('user_id') . ' = ' . (int)$workspaceUserId);
+                    if (in_array('updated_at', $runCols, true)) { $rq->set($db->quoteName('updated_at') . ' = ' . $db->quote($runUpdatedAt)); }
+                    if (in_array('error_message', $runCols, true)) {
+                        $rq->set($db->quoteName('error_message') . ' = ' . $db->quote('Run save blocked: unable to resolve upcoming official target draw date.'));
+                    }
+                    $db->setQuery($rq);
+                    $db->execute();
+                } catch (\Throwable $e) { }
+            }
+            continue;
+        }
         $drawSession = mylottoexpertNormalizeTargetSession((string)($predictionPayload['target_draw_session'] ?? ''));
         $family = $__isDailyBatchOutput ? 'daily' : trim((string)($predictionPayload['target_prediction_family'] ?? 'regular'));
         $ptype = trim((string)($predictionPayload['target_prediction_type'] ?? $family));
         if ($__isDailyBatchOutput && $ptype === '') { $ptype = 'daily'; }
 
         $__batchSaveDrawTarget = function_exists('mylottoexpertResolveOfficialDrawTarget')
-            ? mylottoexpertResolveOfficialDrawTarget((int)$lotteryId, (string)($lotteryRow['game_id'] ?? ''), $drawDate)
+            ? mylottoexpertResolveOfficialDrawTarget((int)$lotteryId, (string)($lotteryRow['game_id'] ?? ''), $drawDate, false)
             : array('target_draw_timezone' => 'America/New_York', 'target_draw_source' => 'fallback', 'target_draw_resolution_note' => '');
         $__batchSaveTz = (string)($__batchSaveDrawTarget['target_draw_timezone'] ?? 'America/New_York');
 
