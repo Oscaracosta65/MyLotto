@@ -34569,7 +34569,7 @@ if ($__mleAction === 'create_skai_batch') {
     $__batchNow = date('Y-m-d H:i:s');
     $__batchGameIdForResearch = (string)($__batchSkaiMeta['gameId'] ?? '');
     $__batchDrawTarget = function_exists('mylottoexpertResolveOfficialDrawTarget')
-        ? mylottoexpertResolveOfficialDrawTarget($__batchLotteryId, $__batchGameIdForResearch, $__batchTargetDrawDate !== '' ? $__batchTargetDrawDate : null, false)
+        ? mylottoexpertResolveOfficialDrawTarget($__batchLotteryId, $__batchGameIdForResearch, $__batchTargetDrawDate !== '' ? $__batchTargetDrawDate : null, true)
         : array('target_draw_date' => $__batchTargetDrawDate, 'target_draw_timezone' => 'America/New_York', 'target_draw_source' => 'fallback', 'target_draw_resolution_note' => '', 'target_draw_label' => $__batchTargetDrawDate);
     if ($__batchTargetDrawDate !== '') {
         $__batchDrawTarget['target_draw_date'] = $__batchTargetDrawDate;
