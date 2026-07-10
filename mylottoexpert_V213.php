@@ -2094,7 +2094,7 @@ function mylottoexpertResolveOfficialDrawTarget($lotteryId, $gameId, $inputDateO
         $gidUpper = strtoupper((string)$gameId);
         $lotteryNameUpper = strtoupper(trim((string)($lotRow['lottery_name'] ?? $lotRow['game_name'] ?? '')));
         $stateCode = '';
-        if (preg_match('/^(CA|TX|FL|WA)[A-Z0-9_\-]*/', $gidUpper, $__stateMatch)) {
+        if (preg_match('/^(CA|TX|FL|WA|LA)[A-Z0-9_\-]*/', $gidUpper, $__stateMatch)) {
             $stateCode = (string)$__stateMatch[1];
         } elseif (strpos($lotteryNameUpper, 'CALIFORNIA') !== false) {
             $stateCode = 'CA';
@@ -2104,12 +2104,15 @@ function mylottoexpertResolveOfficialDrawTarget($lotteryId, $gameId, $inputDateO
             $stateCode = 'FL';
         } elseif (strpos($lotteryNameUpper, 'WASHINGTON') !== false) {
             $stateCode = 'WA';
+        } elseif (strpos($lotteryNameUpper, 'LOUISIANA') !== false) {
+            $stateCode = 'LA';
         }
         $stateTimezoneMap = array(
             'CA' => 'America/Los_Angeles',
             'TX' => 'America/Chicago',
             'FL' => 'America/New_York',
             'WA' => 'America/Los_Angeles',
+            'LA' => 'America/Chicago',
         );
         if ($stateCode !== '' && isset($stateTimezoneMap[$stateCode])) {
             $resolvedTz = (string)$stateTimezoneMap[$stateCode];
@@ -35155,8 +35158,15 @@ if ($__mleAction === 'run_skai_precision_lock_batch') {
         if ($drawDateRaw !== '' && preg_match('/^(\d{4}-\d{2}-\d{2})/', $drawDateRaw, $__ddm)) {
             $drawDate = $__ddm[1];
         } else {
+            /* [[MLE_V213_DAILY_SAVE_FALLBACK]]
+               Daily games (Pick 3/4/5) often have no future official schedule
+               row and no explicit target date in the payload. Allow the
+               now/today fallback for daily games so they can be saved as
+               pending. Regular lotteries keep the strict no-fallback behavior
+               to prevent premature saves without a confirmed future draw. */
+            $__dailyAllowFallback = !empty($__isDailyBatchOutput);
             $__drawFallback = function_exists('mylottoexpertResolveOfficialDrawTarget')
-                ? mylottoexpertResolveOfficialDrawTarget((int)$lotteryId, (string)($lotteryRow['game_id'] ?? ''), null, false)
+                ? mylottoexpertResolveOfficialDrawTarget((int)$lotteryId, (string)($lotteryRow['game_id'] ?? ''), null, $__dailyAllowFallback)
                 : array('target_draw_date' => '');
             $drawDate = (string)($__drawFallback['target_draw_date'] ?? '');
         }
@@ -47093,9 +47103,32 @@ function getNextScheduledDrawing($gameId, $db)
     if ($tbl === '') {
         return null;
     }
+    $cfg = isset($spec['lotteryConfig']) && is_array($spec['lotteryConfig']) ? $spec['lotteryConfig'] : array();
+    $isDaily = !empty($cfg['is_daily']);
 
     $today = date('Y-m-d');
+    $nowSql = date('Y-m-d H:i:s');
     $realTable = $db->replacePrefix($tbl);
+
+    /* [[MLE_V213_NEXT_DRAW_DAILY]]
+       For daily games with time-bearing draw_date rows, prefer rows whose
+       draw_date is >= the current timestamp so that an already-past same-day
+       session is not returned as the "next" draw. Fall back to date-only
+       comparison when that query returns nothing (date-only schedule rows). */
+    if ($isDaily) {
+        $qTime = $db->getQuery(true)
+            ->select('*')
+            ->from($db->quoteName($realTable))
+            ->where($db->quoteName('game_id') . ' = ' . $db->quote((string)$gameId))
+            ->where($db->quoteName('draw_date') . ' >= ' . $db->quote($nowSql))
+            ->order($db->quoteName('draw_date') . ' ASC')
+            ->setLimit(1);
+        $db->setQuery($qTime);
+        $rowTime = $db->loadAssoc();
+        if (is_array($rowTime)) {
+            return $rowTime;
+        }
+    }
 
     $q = $db->getQuery(true)
         ->select('*')
